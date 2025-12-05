@@ -193,6 +193,17 @@ For example, if three sources all say "X", you could say "These three sources al
 Only these fully comprehensive cleaned findings are going to be returned to the user, so it's crucial that you don't lose any information from the raw messages.
 </Task>
 
+<CRITICAL GROUNDING RULES - PREVENT HALLUCINATION>
+You may ONLY include information that appears in the search results and tool outputs above.
+- DO NOT invent, fabricate, or extrapolate any facts, names, statistics, dates, or claims.
+- DO NOT include information from your training data that is not present in the search results.
+- If a product, model, paper, company, or fact is NOT in the search results, DO NOT mention it.
+- If you cannot find enough information, write "Insufficient data found for [topic]" rather than inventing.
+- Every single claim MUST have a citation [#] that maps to an actual search result URL.
+- If you are unsure whether something is in the search results, DO NOT include it.
+- Double-check: Does this claim appear verbatim or clearly stated in one of the sources? If not, remove it.
+</CRITICAL GROUNDING RULES>
+
 <Guidelines>
 1. Your output findings should be fully comprehensive and include ALL of the information and sources that the researcher has gathered from tool calls and web searches. It is expected that you repeat key information verbatim.
 2. This report can be as long as necessary to return ALL of the information that the researcher has gathered.
@@ -200,6 +211,7 @@ Only these fully comprehensive cleaned findings are going to be returned to the 
 4. You should include a "Sources" section at the end of the report that lists all of the sources the researcher found with corresponding citations, cited against statements in the report.
 5. Make sure to include ALL of the sources that the researcher gathered in the report, and how they were used to answer the question!
 6. It's really important not to lose any sources. A later LLM will be used to merge this report with others, so having all of the sources is critical.
+7. NEVER add information that is not present in the search results - this is critical for accuracy.
 </Guidelines>
 
 <Output Format>
@@ -244,6 +256,18 @@ Here are the findings from the research that you conducted:
 <Findings>
 {findings}
 </Findings>
+
+<CRITICAL GROUNDING RULES - PREVENT HALLUCINATION>
+You have NO prior knowledge. You may ONLY use information from the Findings section above.
+- DO NOT invent, fabricate, or extrapolate any facts, names, statistics, dates, or claims.
+- DO NOT add information from your training data - only use what is in the Findings.
+- If something is NOT in the Findings, it DOES NOT EXIST for the purpose of this report.
+- Check dates: Today is {date}. Do NOT include future events or products "released" after today.
+- Every factual claim MUST have a citation [#] that maps to a source in the Findings.
+- If the Findings are insufficient to fully answer the question, explicitly state what is missing.
+- If you mention a product, model, paper, or statistic, verify it appears in the Findings first.
+- NEVER write "released in [future year]" or mention events that haven't happened yet.
+</CRITICAL GROUNDING RULES>
 
 Please create a detailed answer to the overall research brief that:
 1. Is well-organized with proper headings (# for title, ## for sections, ### for subsections)
@@ -307,6 +331,37 @@ Format the report in clear markdown with proper structure and include source ref
 </Citation Rules>
 """
 
+
+fact_check_findings_prompt = """You are a fact-checker reviewing research findings for accuracy and hallucinations.
+
+Today's date is {date}. This is critical for checking date-related claims.
+
+<Findings to Review>
+{findings}
+</Findings to Review>
+
+Your task is to identify potential hallucinations, fabrications, or errors in the research findings.
+
+<What to Check>
+1. **Fabricated Names**: Flag any product names, model names, company names, or paper titles that seem invented or unusual
+2. **Impossible Dates**: Flag any dates in the future (after {date}), or claims like "released in 2025" when it's 2024
+3. **Uncited Claims**: Flag specific statistics, numbers, or factual claims that don't have a citation
+4. **Suspicious Statistics**: Flag statistics that seem too precise or unlikely (e.g., "exactly 847 million users")
+5. **Missing Sources**: Flag claims that reference sources but don't provide URLs
+6. **Contradictions**: Flag claims that contradict each other within the findings
+</What to Check>
+
+<Output Format>
+Provide your assessment with:
+- decision: "approve" (findings are factually grounded), "revise" (some issues found), or "reject" (major fabrications detected)
+- confidence: 0.0 to 1.0 how confident you are
+- issues_found: List of specific issues with explanations
+- suggested_fixes: Specific recommendations to fix the issues
+- reasoning: Overall assessment of the findings quality
+</Output Format>
+
+Be thorough but fair. Minor formatting issues are not grounds for rejection. Focus on factual accuracy and potential hallucinations.
+"""
 
 summarize_webpage_prompt = """You are tasked with summarizing the raw content of a webpage retrieved from a web search. Your goal is to create a summary that preserves the most important information from the original web page. This summary will be used by a downstream research agent, so it's crucial to maintain the key details without losing essential information.
 

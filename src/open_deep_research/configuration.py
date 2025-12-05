@@ -38,6 +38,18 @@ class MCPConfig(BaseModel):
 class Configuration(BaseModel):
     """Main configuration class for the Deep Research agent."""
     
+    # Test Mode - Reduces iterations and costs for faster testing
+    test_mode: bool = Field(
+        default=False,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Enable test mode for faster iteration. Limits: max_researcher_iterations=2, max_react_tool_calls=3, max_concurrent_research_units=2"
+            }
+        }
+    )
+    
     # General Configuration
     max_structured_output_retries: int = Field(
         default=3,
@@ -231,7 +243,79 @@ class Configuration(BaseModel):
             }
         }
     )
-
+    
+    # Council Configuration - Multi-model verification for research briefs
+    use_council: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Enable multi-model council verification for research briefs before execution"
+            }
+        }
+    )
+    council_models: List[str] = Field(
+        default=["openai:gpt-4.1", "openai:gpt-5"],
+        metadata={
+            "x_oap_ui_config": {
+                "type": "text",
+                "default": "openai:gpt-4.1,openai:gpt-5",
+                "description": "Comma-separated list of models for the council (e.g., openai:gpt-4.1,openai:gpt-5)"
+            }
+        }
+    )
+    council_min_consensus: float = Field(
+        default=0.7,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 0.7,
+                "min": 0.1,
+                "max": 1.0,
+                "step": 0.1,
+                "description": "Minimum consensus score required for approval (0.0-1.0). Higher = stricter."
+            }
+        }
+    )
+    council_max_revisions: int = Field(
+        default=3,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 3,
+                "min": 0,
+                "max": 5,
+                "step": 1,
+                "description": "Maximum revision attempts before forcing proceed. 0 = no revisions allowed."
+            }
+        }
+    )
+    
+    # Council 2: Fact-check findings after research
+    use_findings_council: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Enable council fact-checking of research findings before final report. Catches hallucinations and fabrications."
+            }
+        }
+    )
+    findings_max_revisions: int = Field(
+        default=2,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 2,
+                "min": 0,
+                "max": 3,
+                "step": 1,
+                "description": "Maximum revision attempts for findings fact-check. 0 = no revisions."
+            }
+        }
+    )
 
     @classmethod
     def from_runnable_config(
@@ -245,6 +329,18 @@ class Configuration(BaseModel):
             for field_name in field_names
         }
         return cls(**{k: v for k, v in values.items() if v is not None})
+
+    def get_effective_max_researcher_iterations(self) -> int:
+        """Get max researcher iterations, reduced in test mode."""
+        return 2 if self.test_mode else self.max_researcher_iterations
+
+    def get_effective_max_react_tool_calls(self) -> int:
+        """Get max tool calls, reduced in test mode."""
+        return 3 if self.test_mode else self.max_react_tool_calls
+
+    def get_effective_max_concurrent_research_units(self) -> int:
+        """Get max concurrent units, reduced in test mode."""
+        return 2 if self.test_mode else self.max_concurrent_research_units
 
     class Config:
         """Pydantic configuration."""

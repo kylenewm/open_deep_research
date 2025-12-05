@@ -1,7 +1,7 @@
 """Main LangGraph implementation for the Deep Research agent."""
 
 import asyncio
-from typing import Literal
+from typing import List, Literal
 
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import (
@@ -23,6 +23,7 @@ from open_deep_research.prompts import (
     clarify_with_user_instructions,
     compress_research_simple_human_message,
     compress_research_system_prompt,
+    fact_check_findings_prompt,
     final_report_generation_prompt,
     lead_researcher_prompt,
     research_system_prompt,
@@ -51,6 +52,33 @@ from open_deep_research.utils import (
     remove_up_to_last_ai_message,
     think_tool,
 )
+from open_deep_research.council import (
+    council_vote_on_brief,
+    CouncilConfig,
+    log_council_decision,
+)
+from pydantic import BaseModel, Field as PydanticField
+
+# Pydantic model for fact-checking findings
+class FindingsReview(BaseModel):
+    """Structured review of research findings for fact-checking."""
+    
+    decision: Literal["approve", "revise", "reject"] = PydanticField(
+        description="approve=findings are factually grounded, revise=issues found that need fixing, reject=major fabrications detected"
+    )
+    confidence: float = PydanticField(
+        ge=0, le=1,
+        description="How confident are you in this assessment? 0-1"
+    )
+    issues_found: List[str] = PydanticField(
+        description="List of specific issues found (fabricated names, impossible dates, uncited claims, etc.)"
+    )
+    suggested_fixes: List[str] = PydanticField(
+        description="Specific recommendations to fix the issues"
+    )
+    reasoning: str = PydanticField(
+        description="Overall assessment of the findings quality and factual accuracy"
+    )
 
 # Initialize a configurable model that we will use throughout the agent
 configurable_model = init_chat_model(
@@ -115,7 +143,7 @@ async def clarify_with_user(state: AgentState, config: RunnableConfig) -> Comman
         )
 
 
-async def write_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor"]]:
+async def write_research_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["validate_brief"]]:
     """Transform user messages into a structured research brief and initialize supervisor.
     
     This function analyzes the user's messages and generates a focused research brief
@@ -127,7 +155,7 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         config: Runtime configuration with model settings
         
     Returns:
-        Command to proceed to research supervisor with initialized context
+        Command to proceed to brief validation (council) with initialized context
     """
     # Step 1: Set up the research model for structured output
     configurable = Configuration.from_runnable_config(config)
@@ -151,17 +179,24 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         messages=get_buffer_string(state.get("messages", [])),
         date=get_today_str()
     )
+    
+    # Include council feedback if this is a revision attempt
+    feedback_on_brief = state.get("feedback_on_brief", [])
+    if feedback_on_brief:
+        prompt_content += f"\n\nPREVIOUS FEEDBACK TO ADDRESS:\n{feedback_on_brief[-1]}"
+    
     response = await research_model.ainvoke([HumanMessage(content=prompt_content)])
     
     # Step 3: Initialize supervisor with research brief and instructions
+    # Use effective values (reduced in test mode)
     supervisor_system_prompt = lead_researcher_prompt.format(
         date=get_today_str(),
-        max_concurrent_research_units=configurable.max_concurrent_research_units,
-        max_researcher_iterations=configurable.max_researcher_iterations
+        max_concurrent_research_units=configurable.get_effective_max_concurrent_research_units(),
+        max_researcher_iterations=configurable.get_effective_max_researcher_iterations()
     )
     
     return Command(
-        goto="research_supervisor", 
+        goto="validate_brief", 
         update={
             "research_brief": response.research_brief,
             "supervisor_messages": {
@@ -173,6 +208,174 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
             }
         }
     )
+
+
+async def validate_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor", "write_research_brief"]]:
+    """Validate the research brief using the LLM Council before proceeding.
+    
+    This function uses multiple models to vote on whether the research brief is
+    clear, specific, and actionable. If consensus is not reached, it routes back
+    to write_research_brief with feedback for revision.
+    
+    Args:
+        state: Current agent state with research brief
+        config: Runtime configuration with council settings
+        
+    Returns:
+        Command to either proceed to research or loop back for revision
+    """
+    configurable = Configuration.from_runnable_config(config)
+    
+    # Skip council if disabled
+    if not configurable.use_council:
+        return Command(goto="research_supervisor")
+    
+    # Get current brief
+    brief = state.get("research_brief", "")
+    if not brief:
+        # No brief to validate - proceed anyway
+        return Command(goto="research_supervisor")
+    
+    # Build council config from agent configuration
+    council_config = CouncilConfig(
+        models=configurable.council_models,
+        min_consensus_for_approve=configurable.council_min_consensus,
+        max_revision_rounds=configurable.council_max_revisions,
+    )
+    
+    # Get council verdict
+    verdict = await council_vote_on_brief(brief, council_config)
+    
+    # Log the council decision for observability
+    log_council_decision(verdict)
+    
+    # Get current revision count
+    revision_count = state.get("council_revision_count", 0)
+    
+    # Route based on verdict
+    if verdict.decision == "approve":
+        # Brief is good - proceed to research
+        return Command(goto="research_supervisor")
+    
+    elif verdict.decision == "reject" or revision_count >= council_config.max_revision_rounds:
+        # Rejected or max revisions reached - force proceed with warning
+        print(f"[COUNCIL] Forcing proceed after {revision_count} revisions. Feedback: {verdict.synthesized_feedback[:200]}...")
+        return Command(goto="research_supervisor")
+    
+    else:
+        # Needs revision - loop back with feedback
+        return Command(
+            goto="write_research_brief",
+            update={
+                "feedback_on_brief": [verdict.synthesized_feedback],
+                "council_revision_count": revision_count + 1
+            }
+        )
+
+
+async def validate_findings(state: AgentState, config: RunnableConfig) -> Command[Literal["final_report_generation", "research_supervisor"]]:
+    """Fact-check research findings using an LLM council before generating final report.
+    
+    This function validates that research findings are factually grounded and don't contain
+    hallucinations. It checks for fabricated names, impossible dates, uncited claims, etc.
+    
+    Args:
+        state: Current agent state with research notes
+        config: Runtime configuration with fact-check settings
+        
+    Returns:
+        Command to either proceed to final report or loop back to research
+    """
+    configurable = Configuration.from_runnable_config(config)
+    
+    # Skip fact-checking if disabled
+    if not configurable.use_findings_council:
+        return Command(goto="final_report_generation")
+    
+    # Get research findings from notes
+    notes = state.get("notes", [])
+    if not notes:
+        # No findings to validate - proceed anyway
+        return Command(goto="final_report_generation")
+    
+    findings_text = "\n\n".join(notes)
+    
+    # Configure the fact-checking model
+    model_config = {
+        "model": configurable.council_models[0] if configurable.council_models else "openai:gpt-4.1",
+        "max_tokens": 4096,
+        "api_key": get_api_key_for_model(configurable.council_models[0] if configurable.council_models else "openai:gpt-4.1", config),
+        "tags": ["langsmith:fact_check"]
+    }
+    
+    fact_check_model = (
+        configurable_model
+        .with_structured_output(FindingsReview)
+        .with_retry(stop_after_attempt=configurable.max_structured_output_retries)
+        .with_config(model_config)
+    )
+    
+    # Generate fact-check prompt
+    prompt = fact_check_findings_prompt.format(
+        date=get_today_str(),
+        findings=findings_text
+    )
+    
+    try:
+        review: FindingsReview = await fact_check_model.ainvoke([HumanMessage(content=prompt)])
+    except Exception as e:
+        # If fact-check fails, log and proceed
+        print(f"[FACT-CHECK] Error during fact-check: {e}. Proceeding to report.")
+        return Command(goto="final_report_generation")
+    
+    # Log the fact-check decision
+    print(f"\n{'='*60}")
+    print(f"FACT-CHECK DECISION: {review.decision.upper()}")
+    print(f"Confidence: {review.confidence:.0%}")
+    if review.issues_found:
+        print(f"Issues Found: {len(review.issues_found)}")
+        for issue in review.issues_found[:3]:  # Show first 3 issues
+            print(f"  - {issue[:100]}...")
+    print(f"{'='*60}\n")
+    
+    # Get current revision count
+    revision_count = state.get("findings_revision_count", 0)
+    
+    # Route based on decision
+    if review.decision == "approve":
+        return Command(goto="final_report_generation")
+    
+    elif review.decision == "reject" or revision_count >= configurable.findings_max_revisions:
+        # Rejected or max revisions reached - force proceed with warning
+        print(f"[FACT-CHECK] Forcing proceed after {revision_count} revisions. Issues: {review.reasoning[:200]}...")
+        return Command(goto="final_report_generation")
+    
+    else:
+        # Needs revision - loop back to research with feedback
+        feedback = f"FACT-CHECK FEEDBACK: The following issues were found in the research findings:\n"
+        feedback += "\n".join(f"- {issue}" for issue in review.issues_found)
+        feedback += f"\n\nSuggested fixes:\n"
+        feedback += "\n".join(f"- {fix}" for fix in review.suggested_fixes)
+        
+        return Command(
+            goto="research_supervisor",
+            update={
+                "feedback_on_findings": [feedback],
+                "findings_revision_count": revision_count + 1,
+                # Reset supervisor messages with feedback for re-research
+                "supervisor_messages": {
+                    "type": "override",
+                    "value": [
+                        SystemMessage(content=lead_researcher_prompt.format(
+                            date=get_today_str(),
+                            max_concurrent_research_units=configurable.get_effective_max_concurrent_research_units(),
+                            max_researcher_iterations=configurable.get_effective_max_researcher_iterations()
+                        )),
+                        HumanMessage(content=f"{state.get('research_brief', '')}\n\n{feedback}")
+                    ]
+                }
+            }
+        )
 
 
 async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor_tools"]]:
@@ -243,8 +446,8 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     research_iterations = state.get("research_iterations", 0)
     most_recent_message = supervisor_messages[-1]
     
-    # Define exit criteria for research phase
-    exceeded_allowed_iterations = research_iterations > configurable.max_researcher_iterations
+    # Define exit criteria for research phase (use effective values for test mode)
+    exceeded_allowed_iterations = research_iterations > configurable.get_effective_max_researcher_iterations()
     no_tool_calls = not most_recent_message.tool_calls
     research_complete_tool_call = any(
         tool_call["name"] == "ResearchComplete" 
@@ -287,9 +490,10 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
     
     if conduct_research_calls:
         try:
-            # Limit concurrent research units to prevent resource exhaustion
-            allowed_conduct_research_calls = conduct_research_calls[:configurable.max_concurrent_research_units]
-            overflow_conduct_research_calls = conduct_research_calls[configurable.max_concurrent_research_units:]
+            # Limit concurrent research units to prevent resource exhaustion (use effective values for test mode)
+            max_units = configurable.get_effective_max_concurrent_research_units()
+            allowed_conduct_research_calls = conduct_research_calls[:max_units]
+            overflow_conduct_research_calls = conduct_research_calls[max_units:]
             
             # Execute research tasks in parallel
             research_tasks = [
@@ -315,7 +519,7 @@ async def supervisor_tools(state: SupervisorState, config: RunnableConfig) -> Co
             # Handle overflow research calls with error messages
             for overflow_call in overflow_conduct_research_calls:
                 all_tool_messages.append(ToolMessage(
-                    content=f"Error: Did not run this research as you have already exceeded the maximum number of concurrent research units. Please try again with {configurable.max_concurrent_research_units} or fewer research units.",
+                    content=f"Error: Did not run this research as you have already exceeded the maximum number of concurrent research units. Please try again with {max_units} or fewer research units.",
                     name="ConductResearch",
                     tool_call_id=overflow_call["id"]
                 ))
@@ -488,8 +692,8 @@ async def researcher_tools(state: ResearcherState, config: RunnableConfig) -> Co
         for observation, tool_call in zip(observations, tool_calls)
     ]
     
-    # Step 3: Check late exit conditions (after processing tools)
-    exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.max_react_tool_calls
+    # Step 3: Check late exit conditions (after processing tools, use effective values for test mode)
+    exceeded_iterations = state.get("tool_call_iterations", 0) >= configurable.get_effective_max_react_tool_calls()
     research_complete_called = any(
         tool_call["name"] == "ResearchComplete" 
         for tool_call in most_recent_message.tool_calls
@@ -707,13 +911,16 @@ deep_researcher_builder = StateGraph(
 # Add main workflow nodes for the complete research process
 deep_researcher_builder.add_node("clarify_with_user", clarify_with_user)           # User clarification phase
 deep_researcher_builder.add_node("write_research_brief", write_research_brief)     # Research planning phase
+deep_researcher_builder.add_node("validate_brief", validate_brief)                 # Council 1: Brief validation
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)       # Research execution phase
+deep_researcher_builder.add_node("validate_findings", validate_findings)           # Council 2: Fact-check findings
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)  # Report generation phase
 
 # Define main workflow edges for sequential execution
 deep_researcher_builder.add_edge(START, "clarify_with_user")                       # Entry point
-deep_researcher_builder.add_edge("research_supervisor", "final_report_generation") # Research to report
+deep_researcher_builder.add_edge("research_supervisor", "validate_findings")       # Research to fact-check
 deep_researcher_builder.add_edge("final_report_generation", END)                   # Final exit point
+# Note: write_research_brief -> validate_brief, validate_brief routing, and validate_findings routing handled by Command returns
 
 # Compile the complete deep researcher workflow
 deep_researcher = deep_researcher_builder.compile()
