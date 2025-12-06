@@ -67,3 +67,13 @@ tmp/
 temp/
 
 .langgraph_api
+
+# Research runs and test outputs
+runs/
+*.json
+!pyproject.toml
+!langgraph.json
+!tests/**/*.jsonl
+
+# Temporary test scripts
+scripts/test_matching.py

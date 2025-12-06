@@ -316,6 +316,63 @@ class Configuration(BaseModel):
             }
         }
     )
+    
+    # Human Review Mode - Council as Advisor, Human as Authority
+    review_mode: str = Field(
+        default="none",
+        metadata={
+            "x_oap_ui_config": {
+                "type": "select",
+                "default": "none",
+                "description": "Human review checkpoints. 'none'=fully automated, 'brief'=review brief before research, 'full'=review brief AND final report",
+                "options": [
+                    {"label": "None (Fully Automated)", "value": "none"},
+                    {"label": "Brief Only (Review research plan)", "value": "brief"},
+                    {"label": "Full (Review brief + report)", "value": "full"}
+                ]
+            }
+        }
+    )
+    
+    # Claim Verification Configuration
+    use_claim_verification: bool = Field(
+        default=False,  # Off by default until stable
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": False,
+                "description": "Enable claim-level verification health check after report generation. Adds ~60 seconds and ~$0.45 to run."
+            }
+        }
+    )
+    
+    max_claims_to_verify: int = Field(
+        default=25,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 25,
+                "min": 5,
+                "max": 50,
+                "step": 5,
+                "description": "Maximum claims to verify (cost control). Each claim costs ~$0.02."
+            }
+        }
+    )
+    
+    verification_confidence_threshold: float = Field(
+        default=0.8,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 0.8,
+                "min": 0.5,
+                "max": 1.0,
+                "step": 0.1,
+                "description": "Claims below this confidence are flagged as warnings."
+            }
+        }
+    )
 
     @classmethod
     def from_runnable_config(

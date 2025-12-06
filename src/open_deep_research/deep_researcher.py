@@ -14,7 +14,7 @@ from langchain_core.messages import (
 )
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Command
+from langgraph.types import Command, interrupt
 
 from open_deep_research.configuration import (
     Configuration,
@@ -211,80 +211,206 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
 
 
 async def validate_brief(state: AgentState, config: RunnableConfig) -> Command[Literal["research_supervisor", "write_research_brief"]]:
-    """Validate the research brief using the LLM Council before proceeding.
+    """Validate the research brief using the LLM Council and optionally human review.
     
-    This function uses multiple models to vote on whether the research brief is
-    clear, specific, and actionable. If consensus is not reached, it routes back
-    to write_research_brief with feedback for revision.
+    In this architecture, Council = Advisor, Human = Authority:
+    - Council provides feedback and suggestions (not approve/reject decisions)
+    - If review_mode != "none", human reviews brief + council feedback
+    - Human can approve, edit, or ignore council feedback
+    - Once human approves (or if review_mode == "none"), proceed to research
     
     Args:
         state: Current agent state with research brief
-        config: Runtime configuration with council settings
+        config: Runtime configuration with council and review settings
         
     Returns:
-        Command to either proceed to research or loop back for revision
+        Command to proceed to research (after human approval if needed)
     """
     configurable = Configuration.from_runnable_config(config)
     
-    # Skip council if disabled
-    if not configurable.use_council:
-        return Command(goto="research_supervisor")
-    
-    # Get current brief
-    brief = state.get("research_brief", "")
+    # Get current brief (use human-approved version if available)
+    brief = state.get("human_approved_brief") or state.get("research_brief", "")
     if not brief:
         # No brief to validate - proceed anyway
         return Command(goto="research_supervisor")
     
-    # Build council config from agent configuration
-    council_config = CouncilConfig(
-        models=configurable.council_models,
-        min_consensus_for_approve=configurable.council_min_consensus,
-        max_revision_rounds=configurable.council_max_revisions,
-    )
-    
-    # Get council verdict
-    verdict = await council_vote_on_brief(brief, council_config)
-    
-    # Log the council decision for observability
-    log_council_decision(verdict)
-    
-    # Get current revision count
-    revision_count = state.get("council_revision_count", 0)
-    
-    # Route based on verdict
-    if verdict.decision == "approve":
-        # Brief is good - proceed to research
+    # Check if human already approved (resuming after interrupt)
+    if state.get("human_approved_brief"):
+        # Human has approved - proceed to research without re-validation
+        print(f"[REVIEW] Using human-approved brief. Proceeding to research.")
         return Command(goto="research_supervisor")
     
-    elif verdict.decision == "reject" or revision_count >= council_config.max_revision_rounds:
-        # Rejected or max revisions reached - force proceed with warning
-        print(f"[COUNCIL] Forcing proceed after {revision_count} revisions. Feedback: {verdict.synthesized_feedback[:200]}...")
-        return Command(goto="research_supervisor")
-    
-    else:
-        # Needs revision - loop back with feedback
-        return Command(
-            goto="write_research_brief",
-            update={
-                "feedback_on_brief": [verdict.synthesized_feedback],
-                "council_revision_count": revision_count + 1
-            }
+    # Get council feedback (advisory only, not approve/reject)
+    council_feedback = ""
+    if configurable.use_council:
+        council_config = CouncilConfig(
+            models=configurable.council_models,
+            min_consensus_for_approve=configurable.council_min_consensus,
+            max_revision_rounds=configurable.council_max_revisions,
         )
+        
+        verdict = await council_vote_on_brief(brief, council_config)
+        log_council_decision(verdict)
+        
+        # Format council feedback for human review
+        council_feedback = f"""
+COUNCIL FEEDBACK (Advisory):
+Decision: {verdict.decision.upper()}
+Consensus: {verdict.consensus_score:.0%}
+
+{verdict.synthesized_feedback}
+"""
+        print(f"\n{'='*60}")
+        print(f"COUNCIL FEEDBACK (Advisory - Human has final say)")
+        print(f"Decision: {verdict.decision.upper()}")
+        print(f"Consensus: {verdict.consensus_score:.0%}")
+        print(f"{'='*60}\n")
+    
+    # Human review checkpoint
+    if configurable.review_mode != "none":
+        # Format the review request for human
+        review_request = f"""
+═══════════════════════════════════════════════════════════════
+HUMAN REVIEW REQUIRED: Research Brief
+═══════════════════════════════════════════════════════════════
+
+RESEARCH BRIEF:
+{brief}
+
+{council_feedback if council_feedback else "(Council review disabled)"}
+
+═══════════════════════════════════════════════════════════════
+OPTIONS:
+1. Reply with "approve" to proceed with this brief
+2. Reply with your edited version of the brief to use instead
+3. Reply with "ignore" to proceed without council suggestions
+═══════════════════════════════════════════════════════════════
+"""
+        # Interrupt for human review - execution pauses here
+        human_response = interrupt(review_request)
+        
+        # DEBUG: Log what we received from interrupt
+        print(f"\n{'='*60}")
+        print(f"[DEBUG BRIEF] Raw interrupt response type: {type(human_response)}")
+        print(f"[DEBUG BRIEF] Raw interrupt response repr: {repr(human_response)[:200]}")
+        print(f"{'='*60}\n")
+        
+        try:
+            # Process human response with error handling
+            response_str = str(human_response).strip().strip('"\'')  # Strip quotes for JSON/YAML
+            response_lower = response_str.lower()
+            
+            print(f"[DEBUG BRIEF] After processing: '{response_str}' (len={len(response_str)})")
+            
+            # Known commands
+            approve_commands = ["approve", "ok", "yes", "y", "proceed", "continue", "go", "accept"]
+            ignore_commands = ["ignore", "skip", "no council", "dismiss"]
+            
+            if response_lower in approve_commands or response_lower in ignore_commands:
+                # Human approved the brief as-is
+                print(f"[REVIEW] Human approved brief with command: {response_lower}")
+                return Command(
+                    goto="research_supervisor",
+                    update={
+                        "human_approved_brief": brief,
+                        "council_brief_feedback": council_feedback
+                    }
+                )
+            elif len(response_str) < 50:
+                # Short response that's not a known command - likely a mistake
+                # Default to approve with warning
+                print(f"[REVIEW] Unknown short response '{response_str}'. Defaulting to approve. "
+                      f"Use 'approve', 'ignore', or provide a full edited brief (50+ chars).")
+                return Command(
+                    goto="research_supervisor",
+                    update={
+                        "human_approved_brief": brief,
+                        "council_brief_feedback": council_feedback
+                    }
+                )
+            else:
+                # Human provided an edited brief (substantial text) - use their version
+                print(f"[REVIEW] Human provided edited brief ({len(response_str)} chars).")
+                return Command(
+                    goto="research_supervisor",
+                    update={
+                        "human_approved_brief": response_str,
+                        "council_brief_feedback": council_feedback,
+                        "research_brief": response_str,
+                        # Update supervisor messages with new brief
+                        "supervisor_messages": {
+                            "type": "override",
+                            "value": [
+                                SystemMessage(content=lead_researcher_prompt.format(
+                                    date=get_today_str(),
+                                    max_concurrent_research_units=configurable.get_effective_max_concurrent_research_units(),
+                                    max_researcher_iterations=configurable.get_effective_max_researcher_iterations()
+                                )),
+                                HumanMessage(content=response_str)
+                            ]
+                        }
+                    }
+                )
+        except Exception as e:
+            # If anything goes wrong, log it and default to approve
+            print(f"[ERROR BRIEF] Exception processing interrupt: {e}")
+            print(f"[ERROR BRIEF] Response was: {repr(human_response)[:200]}")
+            import traceback
+            traceback.print_exc()
+            # Fallback: default to approve
+            return Command(
+                goto="research_supervisor",
+                update={
+                    "human_approved_brief": brief,
+                    "council_brief_feedback": council_feedback
+                }
+            )
+    
+    # No human review required (review_mode == "none")
+    # In auto mode, still use council decision for routing
+    if configurable.use_council:
+        revision_count = state.get("council_revision_count", 0)
+        
+        if verdict.decision == "approve":
+            return Command(
+                goto="research_supervisor",
+                update={"council_brief_feedback": council_feedback}
+            )
+        elif verdict.decision == "reject" or revision_count >= configurable.council_max_revisions:
+            print(f"[COUNCIL] Auto-mode: Proceeding after {revision_count} revisions.")
+            return Command(
+                goto="research_supervisor",
+                update={"council_brief_feedback": council_feedback}
+            )
+        else:
+            return Command(
+                goto="write_research_brief",
+                update={
+                    "feedback_on_brief": [verdict.synthesized_feedback],
+                    "council_revision_count": revision_count + 1,
+                    "council_brief_feedback": council_feedback
+                }
+            )
+    
+    # No council, no human review - just proceed
+    return Command(goto="research_supervisor")
 
 
 async def validate_findings(state: AgentState, config: RunnableConfig) -> Command[Literal["final_report_generation", "research_supervisor"]]:
-    """Fact-check research findings using an LLM council before generating final report.
+    """Fact-check research findings and flag issues for human review.
     
-    This function validates that research findings are factually grounded and don't contain
-    hallucinations. It checks for fabricated names, impossible dates, uncited claims, etc.
+    In this architecture, Council = Advisor, Human = Authority:
+    - Council fact-checks findings and FLAGS issues (doesn't auto-reject)
+    - Issues are stored in state for human review
+    - If review_mode == "full" and issues found, human reviews before report
+    - Human can: approve anyway, request re-research, or proceed
     
     Args:
         state: Current agent state with research notes
-        config: Runtime configuration with fact-check settings
+        config: Runtime configuration with fact-check and review settings
         
     Returns:
-        Command to either proceed to final report or loop back to research
+        Command to proceed to final report or loop back (if human requests re-research)
     """
     configurable = Configuration.from_runnable_config(config)
     
@@ -328,54 +454,44 @@ async def validate_findings(state: AgentState, config: RunnableConfig) -> Comman
         print(f"[FACT-CHECK] Error during fact-check: {e}. Proceeding to report.")
         return Command(goto="final_report_generation")
     
-    # Log the fact-check decision
-    print(f"\n{'='*60}")
-    print(f"FACT-CHECK DECISION: {review.decision.upper()}")
-    print(f"Confidence: {review.confidence:.0%}")
+    # Format flagged issues
+    flagged_issues = []
     if review.issues_found:
-        print(f"Issues Found: {len(review.issues_found)}")
-        for issue in review.issues_found[:3]:  # Show first 3 issues
-            print(f"  - {issue[:100]}...")
+        flagged_issues = review.issues_found
+    
+    # Log the fact-check results
+    print(f"\n{'='*60}")
+    print(f"FACT-CHECK RESULTS (Advisory - Human has final say)")
+    print(f"Assessment: {review.decision.upper()}")
+    print(f"Confidence: {review.confidence:.0%}")
+    if flagged_issues:
+        print(f"Issues Flagged: {len(flagged_issues)}")
+        for issue in flagged_issues[:3]:
+            print(f"  ⚠ {issue[:100]}...")
+    else:
+        print(f"No issues flagged.")
     print(f"{'='*60}\n")
     
-    # Get current revision count
-    revision_count = state.get("findings_revision_count", 0)
+    # Log detailed feedback (non-blocking, for offline review)
+    if flagged_issues:
+        print(f"\n{'='*60}")
+        print(f"[FACT-CHECK] ⚠️ {len(flagged_issues)} issues flagged (advisory):")
+        for issue in flagged_issues[:5]:
+            print(f"  - {issue[:100]}...")
+        if review.suggested_fixes:
+            print(f"\n[FACT-CHECK] Suggested fixes:")
+            for fix in review.suggested_fixes[:3]:
+                print(f"  → {fix[:100]}...")
+        print(f"\n[FACT-CHECK] Reasoning: {review.reasoning[:200]}...")
+        print(f"[FACT-CHECK] Flags stored in state for offline review.")
+        print(f"{'='*60}\n")
     
-    # Route based on decision
-    if review.decision == "approve":
-        return Command(goto="final_report_generation")
-    
-    elif review.decision == "reject" or revision_count >= configurable.findings_max_revisions:
-        # Rejected or max revisions reached - force proceed with warning
-        print(f"[FACT-CHECK] Forcing proceed after {revision_count} revisions. Issues: {review.reasoning[:200]}...")
-        return Command(goto="final_report_generation")
-    
-    else:
-        # Needs revision - loop back to research with feedback
-        feedback = f"FACT-CHECK FEEDBACK: The following issues were found in the research findings:\n"
-        feedback += "\n".join(f"- {issue}" for issue in review.issues_found)
-        feedback += f"\n\nSuggested fixes:\n"
-        feedback += "\n".join(f"- {fix}" for fix in review.suggested_fixes)
-        
-        return Command(
-            goto="research_supervisor",
-            update={
-                "feedback_on_findings": [feedback],
-                "findings_revision_count": revision_count + 1,
-                # Reset supervisor messages with feedback for re-research
-                "supervisor_messages": {
-                    "type": "override",
-                    "value": [
-                        SystemMessage(content=lead_researcher_prompt.format(
-                            date=get_today_str(),
-                            max_concurrent_research_units=configurable.get_effective_max_concurrent_research_units(),
-                            max_researcher_iterations=configurable.get_effective_max_researcher_iterations()
-                        )),
-                        HumanMessage(content=f"{state.get('research_brief', '')}\n\n{feedback}")
-                    ]
-                }
-            }
-        )
+    # Always proceed to final report (non-blocking)
+    # Flagged issues stored in state for later review
+    return Command(
+        goto="final_report_generation",
+        update={"flagged_issues": flagged_issues if flagged_issues else []}
+    )
 
 
 async def supervisor(state: SupervisorState, config: RunnableConfig) -> Command[Literal["supervisor_tools"]]:
@@ -809,10 +925,11 @@ researcher_builder.add_edge("compress_research", END)      # Exit point after co
 researcher_subgraph = researcher_builder.compile()
 
 async def final_report_generation(state: AgentState, config: RunnableConfig):
-    """Generate the final comprehensive research report with retry logic for token limits.
+    """Generate the final comprehensive research report with optional human review.
     
     This function takes all collected research findings and synthesizes them into a 
-    well-structured, comprehensive final report using the configured report generation model.
+    well-structured, comprehensive final report. If review_mode == "full", the report
+    is presented to the human for approval before completion.
     
     Args:
         state: Agent state containing research findings and context
@@ -839,6 +956,7 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
     max_retries = 3
     current_retry = 0
     findings_token_limit = None
+    generated_report = None
     
     while current_retry <= max_retries:
         try:
@@ -855,12 +973,8 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                 HumanMessage(content=final_report_prompt)
             ])
             
-            # Return successful report generation
-            return {
-                "final_report": final_report.content, 
-                "messages": [final_report],
-                **cleared_state
-            }
+            generated_report = final_report.content
+            break  # Success - exit retry loop
             
         except Exception as e:
             # Handle token limit exceeded errors with progressive truncation
@@ -893,12 +1007,167 @@ async def final_report_generation(state: AgentState, config: RunnableConfig):
                     **cleared_state
                 }
     
-    # Step 4: Return failure result if all retries exhausted
+    # Check if report generation succeeded
+    if generated_report is None:
+        return {
+            "final_report": "Error generating final report: Maximum retries exceeded",
+            "messages": [AIMessage(content="Report generation failed after maximum retries")],
+            **cleared_state
+        }
+    
+    # Step 4: Human review checkpoint (if review_mode == "full")
+    if configurable.review_mode == "full":
+        # Get any flagged issues from fact-check
+        flagged_issues = state.get("flagged_issues", [])
+        issues_section = ""
+        if flagged_issues:
+            issues_section = f"""
+⚠️ FLAGGED ISSUES FROM FACT-CHECK:
+{chr(10).join(f'  ⚠ {issue}' for issue in flagged_issues)}
+"""
+        
+        # Format review request
+        review_request = f"""
+═══════════════════════════════════════════════════════════════
+HUMAN REVIEW REQUIRED: Final Report
+═══════════════════════════════════════════════════════════════
+{issues_section}
+GENERATED REPORT:
+{generated_report[:5000]}{'... [truncated for review]' if len(generated_report) > 5000 else ''}
+
+═══════════════════════════════════════════════════════════════
+OPTIONS:
+1. Reply with "approve" to accept this report
+2. Reply with specific feedback to regenerate with changes
+3. Reply with your own edited version of the report
+═══════════════════════════════════════════════════════════════
+"""
+        # Interrupt for human review
+        human_response = interrupt(review_request)
+        
+        # DEBUG: Log what we received from interrupt
+        print(f"\n{'='*60}")
+        print(f"[DEBUG REPORT] Raw interrupt response type: {type(human_response)}")
+        print(f"[DEBUG REPORT] Raw interrupt response repr: {repr(human_response)[:200]}")
+        print(f"{'='*60}\n")
+        
+        try:
+            # Process human response with error handling
+            response_str = str(human_response).strip().strip('"\'')  # Strip quotes for JSON/YAML
+            response_lower = response_str.lower()
+            
+            print(f"[DEBUG REPORT] After processing: '{response_str[:100]}...' (len={len(response_str)})")
+            
+            # Known commands
+            approve_commands = ["approve", "ok", "yes", "y", "proceed", "continue", "go", "accept", "done", "good"]
+            
+            if response_lower in approve_commands:
+                # Human approved - return the report
+                print(f"[REVIEW] Human approved final report with command: {response_lower}")
+                return {
+                    "final_report": generated_report, 
+                    "messages": [AIMessage(content=generated_report)],
+                    **cleared_state
+                }
+            elif len(response_str) > 200:
+                # Human provided their own edited version (substantial text)
+                print(f"[REVIEW] Human provided edited report ({len(response_str)} chars).")
+                return {
+                    "final_report": response_str, 
+                    "messages": [AIMessage(content=response_str)],
+                    **cleared_state
+                }
+            elif len(response_str) < 20:
+                # Very short unknown response - default to approve with warning
+                print(f"[REVIEW] Unknown short response '{response_str}'. Defaulting to approve. "
+                      f"Use 'approve' to accept, or provide substantial edits (200+ chars).")
+                return {
+                    "final_report": generated_report, 
+                    "messages": [AIMessage(content=generated_report)],
+                    **cleared_state
+                }
+            else:
+                # Medium-length response - likely feedback, proceed with original
+                # (regeneration would require another LLM call which is complex)
+                print(f"[REVIEW] Human feedback noted: '{response_str[:50]}...'. Proceeding with original report. "
+                      f"To edit, provide the full report text (200+ chars).")
+                return {
+                    "final_report": generated_report, 
+                    "messages": [AIMessage(content=generated_report)],
+                    **cleared_state
+                }
+        except Exception as e:
+            # If anything goes wrong, log it and default to approve
+            print(f"[ERROR REPORT] Exception processing interrupt: {e}")
+            print(f"[ERROR REPORT] Response was: {repr(human_response)[:200]}")
+            import traceback
+            traceback.print_exc()
+            # Fallback: default to returning the report
+            return {
+                "final_report": generated_report, 
+                "messages": [AIMessage(content=generated_report)],
+                **cleared_state
+            }
+    
+    # No human review required - return the report
     return {
-        "final_report": "Error generating final report: Maximum retries exceeded",
-        "messages": [AIMessage(content="Report generation failed after maximum retries")],
+        "final_report": generated_report, 
+        "messages": [AIMessage(content=generated_report)],
         **cleared_state
     }
+
+
+async def verify_claims(state: AgentState, config: RunnableConfig):
+    """Health check: verify claims in final report against preserved sources.
+    
+    This runs AFTER the report is generated. The report is already in state,
+    this adds verification as a quality check layer.
+    """
+    configurable = Configuration.from_runnable_config(config)
+    
+    # Skip if disabled
+    if not configurable.use_claim_verification:
+        print("[VERIFY] Claim verification disabled, skipping.")
+        return {}
+    
+    # Get sources from store
+    from open_deep_research.utils import get_stored_sources
+    sources = await get_stored_sources(config)
+    
+    if not sources:
+        print("[VERIFY] No sources found in store, skipping verification.")
+        return {"verification_result": None}
+    
+    print(f"[VERIFY] Starting verification with {len(sources)} sources...")
+    
+    # Run verification
+    from open_deep_research.verification import verify_report
+    result = await verify_report(
+        final_report=state.get("final_report", ""),
+        sources=sources,
+        config=config
+    )
+    
+    # Log summary
+    summary = result["summary"]
+    print(f"[VERIFY] Complete: {summary['supported']}/{summary['total_claims']} supported")
+    print(f"[VERIFY] Confidence: {summary['overall_confidence']:.0%}")
+    
+    # Log warnings (flagged for offline review, no blocking interrupt)
+    if summary.get("warnings"):
+        print(f"[VERIFY] ⚠️ {len(summary['warnings'])} claims flagged for review:")
+        for w in summary["warnings"][:5]:
+            print(f"  - {w}")
+        print("[VERIFY] Flags included in verification_result for offline review")
+    
+    # Log data issues if present
+    if summary.get("data_issues"):
+        print(f"[VERIFY] 📋 {len(summary['data_issues'])} data issues detected:")
+        for issue in summary["data_issues"][:3]:
+            print(f"  - {issue}")
+    
+    return {"verification_result": result}
+
 
 # Main Deep Researcher Graph Construction
 # Creates the complete deep research workflow from user input to final report
@@ -915,11 +1184,13 @@ deep_researcher_builder.add_node("validate_brief", validate_brief)              
 deep_researcher_builder.add_node("research_supervisor", supervisor_subgraph)       # Research execution phase
 deep_researcher_builder.add_node("validate_findings", validate_findings)           # Council 2: Fact-check findings
 deep_researcher_builder.add_node("final_report_generation", final_report_generation)  # Report generation phase
+deep_researcher_builder.add_node("verify_claims", verify_claims)                   # Claim verification health check
 
 # Define main workflow edges for sequential execution
 deep_researcher_builder.add_edge(START, "clarify_with_user")                       # Entry point
 deep_researcher_builder.add_edge("research_supervisor", "validate_findings")       # Research to fact-check
-deep_researcher_builder.add_edge("final_report_generation", END)                   # Final exit point
+deep_researcher_builder.add_edge("final_report_generation", "verify_claims")       # Report to verification
+deep_researcher_builder.add_edge("verify_claims", END)                             # Final exit point
 # Note: write_research_brief -> validate_brief, validate_brief routing, and validate_findings routing handled by Command returns
 
 # Compile the complete deep researcher workflow

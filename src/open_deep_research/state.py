@@ -1,12 +1,55 @@
 """Graph state definitions and data structures for the Deep Research agent."""
 
 import operator
-from typing import Annotated, Optional
+from typing import Annotated, Optional, List
 
 from langchain_core.messages import MessageLikeRepresentation
 from langgraph.graph import MessagesState
 from pydantic import BaseModel, Field
 from typing_extensions import TypedDict
+
+
+###################
+# Verification Types
+###################
+
+class SourceRecord(TypedDict):
+    """Record of a source document for verification."""
+    url: str
+    title: str
+    content: str      # Raw content, up to 50k chars
+    query: str        # Search query that found this
+    timestamp: str    # ISO timestamp
+
+
+class ClaimVerification(TypedDict):
+    """Result of verifying a single claim."""
+    claim_id: str
+    claim_text: str
+    status: str       # SUPPORTED, PARTIALLY_SUPPORTED, UNSUPPORTED, UNCERTAIN
+    confidence: float
+    source_url: Optional[str]
+    source_title: Optional[str]
+    evidence_snippet: Optional[str]
+
+
+class VerificationSummary(TypedDict, total=False):
+    """Summary statistics for verification."""
+    total_claims: int
+    supported: int
+    partially_supported: int
+    unsupported: int
+    uncertain: int
+    overall_confidence: float
+    verified_at: str
+    warnings: List[str]
+    data_issues: List[str]  # Optional: logged data quality issues for debugging
+
+
+class VerificationResult(TypedDict):
+    """Complete verification output."""
+    summary: VerificationSummary
+    claims: List[ClaimVerification]
 
 
 ###################
@@ -78,6 +121,15 @@ class AgentState(MessagesState):
     # Council 2: Findings fact-check tracking
     findings_revision_count: int = 0
     feedback_on_findings: Annotated[list[str], override_reducer] = []
+    
+    # Human Review Mode fields (Council as Advisor, Human as Authority)
+    council_brief_feedback: str = ""  # Council's feedback on the brief (advisory)
+    flagged_issues: Annotated[list[str], override_reducer] = []  # Fact-check flagged issues
+    human_approved_brief: Optional[str] = None  # Human-edited brief (if modified)
+    
+    # Claim Verification fields
+    source_store: Annotated[list[SourceRecord], operator.add] = []  # Accumulated sources for verification
+    verification_result: Optional[VerificationResult] = None  # Final verification output
 
 class SupervisorState(TypedDict):
     """State for the supervisor that manages research tasks."""

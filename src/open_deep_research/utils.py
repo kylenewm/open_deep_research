@@ -31,7 +31,78 @@ from tavily import AsyncTavilyClient
 
 from open_deep_research.configuration import Configuration, SearchAPI
 from open_deep_research.prompts import summarize_webpage_prompt
-from open_deep_research.state import ResearchComplete, Summary
+from open_deep_research.state import ResearchComplete, Summary, SourceRecord
+
+##########################
+# Source Storage Utils
+##########################
+
+def get_source_store_key(config: RunnableConfig) -> str:
+    """Generate unique key for source storage per thread."""
+    thread_id = config.get("configurable", {}).get("thread_id", "default")
+    return f"verification_sources_{thread_id}"
+
+
+async def store_source_records(
+    records: List[dict], 
+    config: RunnableConfig,
+    max_content_length: int = 50000
+) -> None:
+    """Store source records in LangGraph store for later verification.
+    
+    Args:
+        records: List of source record dicts with url, title, content, query
+        config: Runtime config containing thread_id
+        max_content_length: Max chars to store per source (default 50k)
+    """
+    store = get_store()
+    if store is None:
+        logging.warning("[SOURCES] No store available, skipping source storage")
+        return
+    
+    key = get_source_store_key(config)
+    
+    # Get existing sources
+    try:
+        existing_item = await store.aget(("verification",), key)
+        existing = existing_item.value if existing_item else []
+    except Exception:
+        existing = []
+    
+    # Add new sources (dedupe by URL)
+    existing_urls = {s.get("url") for s in existing}
+    new_records = []
+    for record in records:
+        if record.get("url") not in existing_urls:
+            # Truncate content to max length
+            record["content"] = record.get("content", "")[:max_content_length]
+            record["timestamp"] = datetime.now().isoformat()
+            new_records.append(record)
+            existing_urls.add(record.get("url"))
+    
+    if new_records:
+        all_records = existing + new_records
+        await store.aput(("verification",), key, all_records)
+        logging.info(f"[SOURCES] Stored {len(new_records)} new sources (total: {len(all_records)})")
+
+
+async def get_stored_sources(config: RunnableConfig) -> List[dict]:
+    """Retrieve all stored source records for this thread."""
+    store = get_store()
+    if store is None:
+        logging.info("[SOURCES] No store available, returning empty list")
+        return []
+    
+    key = get_source_store_key(config)
+    try:
+        item = await store.aget(("verification",), key)
+        sources = item.value if item else []
+        logging.info(f"[SOURCES] Retrieved {len(sources)} sources for verification")
+        return sources
+    except Exception as e:
+        logging.warning(f"[SOURCES] Failed to retrieve sources: {e}")
+        return []
+
 
 ##########################
 # Tavily Search Tool Utils
@@ -121,6 +192,26 @@ async def tavily_search(
             summaries
         )
     }
+    
+    # Step 6.5: Store raw source records for verification (SIDE EFFECT)
+    # This doesn't change what the LLM sees, but preserves sources for later
+    source_records_to_store = [
+        {
+            "url": url,
+            "title": result.get("title", ""),
+            "content": result.get("raw_content") or result.get("content", ""),
+            "query": result.get("query", "")
+        }
+        for url, result in unique_results.items()
+        if result.get("raw_content") or result.get("content")
+    ]
+    
+    # Store asynchronously (fire and forget, don't block tool response)
+    if source_records_to_store and config:
+        try:
+            await store_source_records(source_records_to_store, config)
+        except Exception as e:
+            logging.warning(f"[SOURCES] Failed to store sources: {e}")
     
     # Step 7: Format the final output
     if not summarized_results:
