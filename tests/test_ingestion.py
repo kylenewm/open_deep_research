@@ -53,7 +53,7 @@ class TestSecUserAgentConfig:
     
     def test_valid_user_agent_is_accepted(self):
         """Valid SEC_USER_AGENT should be returned."""
-        test_agent = "TestCompany test@example.com"
+        test_agent = "AcmeResearch analyst@acmecorp.io"
         with mock.patch.dict(os.environ, {"SEC_USER_AGENT": test_agent}):
             result = get_sec_user_agent()
             assert result == test_agent
