@@ -12,6 +12,9 @@ from dataclasses import dataclass, field
 from pydantic import BaseModel, Field
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
+
+from open_deep_research.utils import get_api_key_for_model
 
 logger = logging.getLogger(__name__)
 
@@ -72,10 +75,10 @@ class CouncilVerdict(BaseModel):
 class CouncilConfig:
     """Configuration for the LLM council."""
     
-    # Models in the council (GPT-4.1 + GPT-5 by default)
+    # Models in the council (GPT-4.1 + Claude Sonnet 4.5 dated model by default)
     models: List[str] = field(default_factory=lambda: [
         "openai:gpt-4.1",
-        "openai:gpt-5",
+        "anthropic:claude-sonnet-4-5-20250929",
     ])
     
     # Consensus thresholds
@@ -123,19 +126,25 @@ Be constructive. If you suggest revisions, be specific about what to change."""
 async def get_single_vote(
     model_name: str,
     brief: str,
+    runnable_config: Optional[RunnableConfig] = None,
 ) -> CouncilVote:
     """Get one council member's vote on a research brief.
     
     Args:
-        model_name: The model identifier (e.g., "openai:gpt-4.1")
+        model_name: The model identifier (e.g., "openai:gpt-4.1", "anthropic:claude-sonnet-4")
         brief: The research brief to evaluate
+        runnable_config: Runtime configuration for API key access
         
     Returns:
         CouncilVote with the model's decision and reasoning
     """
-    # Initialize model with LangSmith tracing tag
+    # Get API key for this model
+    api_key = get_api_key_for_model(model_name, runnable_config) if runnable_config else None
+    
+    # Initialize model with LangSmith tracing tag and API key
     llm = init_chat_model(
         model=model_name,
+        api_key=api_key,
         tags=["langsmith:council_vote"]
     )
     
@@ -218,18 +227,26 @@ def calculate_verdict(votes: List[CouncilVote], config: CouncilConfig) -> Counci
     )
 
 
-async def synthesize_feedback(votes: List[CouncilVote], synthesis_model: str) -> str:
+async def synthesize_feedback(
+    votes: List[CouncilVote], 
+    synthesis_model: str,
+    runnable_config: Optional[RunnableConfig] = None
+) -> str:
     """Combine all council feedback into actionable revision instructions.
     
     Args:
         votes: List of council votes with feedback
         synthesis_model: Model to use for synthesis
+        runnable_config: Runtime configuration for API key access
         
     Returns:
         Synthesized, prioritized feedback string
     """
+    api_key = get_api_key_for_model(synthesis_model, runnable_config) if runnable_config else None
+    
     llm = init_chat_model(
         model=synthesis_model,
+        api_key=api_key,
         tags=["langsmith:council_synthesis"]
     )
     
@@ -256,7 +273,8 @@ Keep it brief - no more than 5 bullet points."""
 
 async def council_vote_on_brief(
     brief: str,
-    config: CouncilConfig
+    config: CouncilConfig,
+    runnable_config: Optional[RunnableConfig] = None
 ) -> CouncilVerdict:
     """Have the council vote on a research brief.
     
@@ -265,13 +283,14 @@ async def council_vote_on_brief(
     Args:
         brief: The research brief to evaluate
         config: Council configuration
+        runnable_config: Runtime configuration for API key access
         
     Returns:
         CouncilVerdict with decision and feedback
     """
     # Get votes from all council members in parallel
     vote_tasks = [
-        get_single_vote(model, brief)
+        get_single_vote(model, brief, runnable_config)
         for model in config.models
     ]
     votes = await asyncio.gather(*vote_tasks)
@@ -283,7 +302,8 @@ async def council_vote_on_brief(
     if verdict.decision != "approve":
         verdict.synthesized_feedback = await synthesize_feedback(
             list(votes), 
-            config.get_synthesis_model()
+            config.get_synthesis_model(),
+            runnable_config
         )
     
     return verdict

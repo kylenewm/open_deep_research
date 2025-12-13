@@ -91,6 +91,34 @@ class ResearchQuestion(BaseModel):
     )
 
 
+class BriefContext(BaseModel):
+    """Context gathered from preliminary Tavily search to inform brief generation.
+    
+    This is populated before brief generation to inject recent, relevant context
+    into the research brief, making it more specific and grounded in current events.
+    """
+    key_entities: List[str] = Field(
+        default_factory=list,
+        description="Companies, people, products, technologies discovered from search"
+    )
+    recent_events: List[str] = Field(
+        default_factory=list,
+        description="Recent news or developments from last 3-6 months"
+    )
+    key_metrics: List[str] = Field(
+        default_factory=list,
+        description="Numbers, percentages, dates, financial figures found"
+    )
+    context_summary: str = Field(
+        default="",
+        description="2-3 sentence summary of the most relevant context"
+    )
+    sources_used: List[str] = Field(
+        default_factory=list,
+        description="URLs of sources consulted for transparency"
+    )
+
+
 ###################
 # State Definitions
 ###################

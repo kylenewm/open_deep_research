@@ -421,3 +421,79 @@ Remember, your goal is to create a summary that can be easily understood and uti
 
 Today's date is {date}.
 """
+
+
+###################
+# Brief Context Injection Prompts
+###################
+
+generate_context_queries_prompt = """Generate {num_queries} broad, exploratory search queries to gather context for this research request.
+
+User request:
+{user_messages}
+
+Today's date is {date}.
+
+IMPORTANT: Keep queries OPEN-ENDED and EXPLORATORY.
+- Good: "NVIDIA AI latest developments"
+- Bad: "NVIDIA H100 vs AMD MI300X datacenter competition" (too specific, assumes knowledge we don't have yet)
+
+The goal is to DISCOVER what's relevant, not confirm assumptions.
+
+Generate queries that explore:
+1. Recent news and developments about the main subject
+2. General market/industry context  
+3. Key players and competitive landscape (if applicable)
+
+Return ONLY a valid JSON array of strings. Example:
+["query 1", "query 2", "query 3"]
+"""
+
+
+extract_brief_context_prompt = """Extract key context from these search results to inform a research brief.
+
+Search Results (from last {days} days):
+{search_results}
+
+Original User Query:
+{user_query}
+
+Extract the following information from ONLY what is in the search results:
+
+1. key_entities: Companies, people, products, technologies MENTIONED in the results
+2. recent_events: News or developments from the last 3-6 months
+3. key_metrics: Numbers, percentages, dates, financial figures
+4. context_summary: 2-3 sentences summarizing the most relevant context for research
+
+Be factual - only extract what's explicitly stated in the results. Do not infer or add information.
+
+Return as JSON with this exact structure:
+{{
+    "key_entities": ["entity1", "entity2", ...],
+    "recent_events": ["event1", "event2", ...],
+    "key_metrics": ["metric1", "metric2", ...],
+    "context_summary": "2-3 sentence summary here"
+}}
+"""
+
+
+brief_context_injection_instructions = """
+RECENT CONTEXT (from the last {days} days):
+Use this context to make the research question more specific and grounded in current reality.
+
+Key Entities Discovered: {entities}
+Recent Events: {events}  
+Key Metrics: {metrics}
+
+Context Summary: {summary}
+
+Sources: {sources}
+
+INSTRUCTIONS FOR USING THIS CONTEXT:
+- Reference specific entities, events, or metrics discovered above
+- Include relevant dates or timeframes from the context
+- Ground the research question in current market/industry reality
+- Prioritize the user's original intent - context should enhance, not override
+
+Do NOT ignore this context - it contains fresh, relevant information that will make the research more focused.
+"""

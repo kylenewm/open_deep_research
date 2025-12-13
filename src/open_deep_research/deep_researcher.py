@@ -42,6 +42,8 @@ from open_deep_research.state import (
 )
 from open_deep_research.utils import (
     anthropic_websearch_called,
+    format_brief_context,
+    gather_brief_context,
     get_all_tools,
     get_api_key_for_model,
     get_model_token_limit,
@@ -150,6 +152,9 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     that will guide the research supervisor. It also sets up the initial supervisor
     context with appropriate prompts and instructions.
     
+    If brief context injection is enabled, it first gathers recent context from Tavily
+    to make the brief more specific and grounded in current events.
+    
     Args:
         state: Current agent state containing user messages
         config: Runtime configuration with model settings
@@ -159,6 +164,8 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
     """
     # Step 1: Set up the research model for structured output
     configurable = Configuration.from_runnable_config(config)
+    user_messages = get_buffer_string(state.get("messages", []))
+    
     research_model_config = {
         "model": configurable.research_model,
         "max_tokens": configurable.research_model_max_tokens,
@@ -174,11 +181,35 @@ async def write_research_brief(state: AgentState, config: RunnableConfig) -> Com
         .with_config(research_model_config)
     )
     
-    # Step 2: Generate structured research brief from user messages
+    # Step 2: Gather recent context if enabled (pre-search for recency)
+    # Skip on revisions - context already gathered on first attempt, no need to re-search
+    context_block = ""
+    revision_count = state.get("council_revision_count", 0)
+    if configurable.enable_brief_context and revision_count == 0:
+        try:
+            brief_context = await gather_brief_context(
+                user_messages=user_messages,
+                config=config,
+                max_queries=configurable.brief_context_max_queries,
+                max_results=configurable.brief_context_max_results,
+                days=configurable.brief_context_days,
+                include_news=configurable.brief_context_include_news
+            )
+            context_block = format_brief_context(brief_context, configurable.brief_context_days)
+        except Exception as e:
+            # Log but don't fail - context is optional enhancement
+            import logging
+            logging.warning(f"Brief context gathering failed, proceeding without: {e}")
+    
+    # Step 3: Generate structured research brief from user messages + context
     prompt_content = transform_messages_into_research_topic_prompt.format(
-        messages=get_buffer_string(state.get("messages", [])),
+        messages=user_messages,
         date=get_today_str()
     )
+    
+    # Inject gathered context if available
+    if context_block:
+        prompt_content += f"\n\n{context_block}"
     
     # Include council feedback if this is a revision attempt
     feedback_on_brief = state.get("feedback_on_brief", [])
@@ -249,7 +280,7 @@ async def validate_brief(state: AgentState, config: RunnableConfig) -> Command[L
             max_revision_rounds=configurable.council_max_revisions,
         )
         
-        verdict = await council_vote_on_brief(brief, council_config)
+        verdict = await council_vote_on_brief(brief, council_config, config)
         log_council_decision(verdict)
         
         # Format council feedback for human review
@@ -1123,6 +1154,7 @@ async def verify_claims(state: AgentState, config: RunnableConfig):
     This runs AFTER the report is generated. The report is already in state,
     this adds verification as a quality check layer.
     """
+    import re
     configurable = Configuration.from_runnable_config(config)
     
     # Skip if disabled
@@ -1130,14 +1162,33 @@ async def verify_claims(state: AgentState, config: RunnableConfig):
         print("[VERIFY] Claim verification disabled, skipping.")
         return {}
     
-    # Get sources from store
+    # Get sources from store first
     from open_deep_research.utils import get_stored_sources
     sources = await get_stored_sources(config)
     
+    # Fallback: parse sources from raw_notes if store is empty
     if not sources:
-        print("[VERIFY] No sources found in store, skipping verification.")
+        print("[VERIFY] Store empty, parsing sources from raw_notes...")
+        raw_notes = state.get("raw_notes", [])
+        if raw_notes:
+            raw_notes_str = "\n".join(raw_notes) if isinstance(raw_notes, list) else str(raw_notes)
+            # Parse sources from formatted output: --- SOURCE N: TITLE ---\nURL: url\n\nSUMMARY:\ncontent
+            source_pattern = r'--- SOURCE \d+: (.+?) ---\nURL: (.+?)\n\n(?:SUMMARY:\n)?(.+?)(?=--- SOURCE|\Z)'
+            matches = re.findall(source_pattern, raw_notes_str, re.DOTALL)
+            sources = [
+                {"title": title.strip(), "url": url.strip(), "content": content.strip()[:5000]}
+                for title, url, content in matches
+            ]
+            if sources:
+                print(f"[VERIFY] Parsed {len(sources)} sources from raw_notes")
+    
+    if not sources:
+        print("[VERIFY] No sources found, skipping verification.")
         return {"verification_result": None}
     
+    # Store parsed sources in state for output visibility
+    source_store_update = sources if sources else []
+
     print(f"[VERIFY] Starting verification with {len(sources)} sources...")
     
     # Run verification
@@ -1166,7 +1217,7 @@ async def verify_claims(state: AgentState, config: RunnableConfig):
         for issue in summary["data_issues"][:3]:
             print(f"  - {issue}")
     
-    return {"verification_result": result}
+    return {"verification_result": result, "source_store": source_store_update}
 
 
 # Main Deep Researcher Graph Construction

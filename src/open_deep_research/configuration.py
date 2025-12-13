@@ -256,12 +256,12 @@ class Configuration(BaseModel):
         }
     )
     council_models: List[str] = Field(
-        default=["openai:gpt-4.1", "openai:gpt-5"],
+        default=["openai:gpt-4.1", "anthropic:claude-sonnet-4-5-20250929"],
         metadata={
             "x_oap_ui_config": {
                 "type": "text",
-                "default": "openai:gpt-4.1,openai:gpt-5",
-                "description": "Comma-separated list of models for the council (e.g., openai:gpt-4.1,openai:gpt-5)"
+                "default": "openai:gpt-4.1,anthropic:claude-sonnet-4-5-20250929",
+                "description": "Comma-separated list of models for the council (e.g., openai:gpt-4.1,anthropic:claude-sonnet-4-5-20250929)"
             }
         }
     )
@@ -330,6 +330,68 @@ class Configuration(BaseModel):
                     {"label": "Brief Only (Review research plan)", "value": "brief"},
                     {"label": "Full (Review brief + report)", "value": "full"}
                 ]
+            }
+        }
+    )
+    
+    # Brief Context Injection Configuration
+    # Pre-searches to inject recent context into brief generation
+    enable_brief_context: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Enable Tavily pre-search to inject recent context into brief generation. Improves brief specificity."
+            }
+        }
+    )
+    brief_context_max_queries: int = Field(
+        default=3,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 3,
+                "min": 1,
+                "max": 5,
+                "step": 1,
+                "description": "Number of exploratory search queries to generate for context gathering."
+            }
+        }
+    )
+    brief_context_max_results: int = Field(
+        default=5,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 5,
+                "min": 3,
+                "max": 10,
+                "step": 1,
+                "description": "Maximum results per search query for context gathering."
+            }
+        }
+    )
+    brief_context_days: int = Field(
+        default=90,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "slider",
+                "default": 90,
+                "min": 30,
+                "max": 180,
+                "step": 30,
+                "description": "Only search for content from the last N days. 90 = 3 months, 180 = 6 months."
+            }
+        }
+    )
+    brief_context_include_news: bool = Field(
+        default=True,
+        metadata={
+            "x_oap_ui_config": {
+                "type": "boolean",
+                "default": True,
+                "description": "Also search news sources for recent developments (in addition to general search)."
             }
         }
     )

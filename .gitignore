@@ -77,3 +77,9 @@ runs/
 
 # Temporary test scripts
 scripts/test_matching.py
+prompts/
+SCRATCHPAD.md
+.cursorrules
+runs/
+scripts/sanity_check_*.py
+scripts/test_matching.py

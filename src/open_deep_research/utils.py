@@ -30,8 +30,12 @@ from mcp import McpError
 from tavily import AsyncTavilyClient
 
 from open_deep_research.configuration import Configuration, SearchAPI
-from open_deep_research.prompts import summarize_webpage_prompt
-from open_deep_research.state import ResearchComplete, Summary, SourceRecord
+from open_deep_research.prompts import (
+    summarize_webpage_prompt,
+    generate_context_queries_prompt,
+    extract_brief_context_prompt,
+)
+from open_deep_research.state import ResearchComplete, Summary, SourceRecord, BriefContext
 
 ##########################
 # Source Storage Utils
@@ -231,6 +235,7 @@ async def tavily_search_async(
     max_results: int = 5, 
     topic: Literal["general", "news", "finance"] = "general", 
     include_raw_content: bool = True, 
+    days: Optional[int] = None,
     config: RunnableConfig = None
 ):
     """Execute multiple Tavily search queries asynchronously.
@@ -240,6 +245,7 @@ async def tavily_search_async(
         max_results: Maximum number of results per query
         topic: Topic category for filtering results
         include_raw_content: Whether to include full webpage content
+        days: Optional limit to last N days (e.g., 90 for 3 months)
         config: Runtime configuration for API key access
         
     Returns:
@@ -248,20 +254,185 @@ async def tavily_search_async(
     # Initialize the Tavily client with API key from config
     tavily_client = AsyncTavilyClient(api_key=get_tavily_api_key(config))
     
+    # Build search parameters
+    search_params = {
+        "max_results": max_results,
+        "include_raw_content": include_raw_content,
+        "topic": topic
+    }
+    if days is not None:
+        search_params["days"] = days
+    
     # Create search tasks for parallel execution
     search_tasks = [
-        tavily_client.search(
-            query,
-            max_results=max_results,
-            include_raw_content=include_raw_content,
-            topic=topic
-        )
+        tavily_client.search(query, **search_params)
         for query in search_queries
     ]
     
     # Execute all search queries in parallel and return results
     search_results = await asyncio.gather(*search_tasks)
     return search_results
+
+
+##########################
+# Brief Context Injection
+##########################
+
+async def gather_brief_context(
+    user_messages: str,
+    config: RunnableConfig,
+    max_queries: int = 3,
+    max_results: int = 5,
+    days: int = 90,
+    include_news: bool = True
+) -> BriefContext:
+    """Gather recent context from Tavily to inform brief generation.
+    
+    This pre-searches for recent context before brief generation to make
+    research briefs more specific and grounded in current events.
+    
+    Args:
+        user_messages: The user's research request/messages
+        config: Runtime configuration for API keys
+        max_queries: Number of exploratory queries to generate
+        max_results: Maximum results per query
+        days: Only search last N days (default 90 = 3 months)
+        include_news: Also search news sources for recent developments
+        
+    Returns:
+        BriefContext with entities, events, metrics, summary, and sources
+    """
+    configurable = Configuration.from_runnable_config(config)
+    
+    # Step 1: Generate open-ended search queries using LLM
+    query_model = init_chat_model(
+        model=configurable.summarization_model,  # Use fast model
+        api_key=get_api_key_for_model(configurable.summarization_model, config),
+        tags=["langsmith:brief_context_queries"]
+    )
+    
+    query_prompt = generate_context_queries_prompt.format(
+        num_queries=max_queries,
+        user_messages=user_messages,
+        date=get_today_str()
+    )
+    
+    try:
+        query_response = await query_model.ainvoke([HumanMessage(content=query_prompt)])
+        # Parse JSON array from response
+        import json
+        queries = json.loads(query_response.content.strip())
+        if not isinstance(queries, list):
+            queries = [user_messages]  # Fallback to raw user input
+    except Exception as e:
+        logging.warning(f"Failed to generate context queries: {e}, using raw user input")
+        queries = [user_messages]
+    
+    # Step 2: Execute Tavily searches with recency filter
+    all_results = []
+    sources_used = []
+    
+    # Search general topic
+    try:
+        general_results = await tavily_search_async(
+            search_queries=queries,
+            max_results=max_results,
+            topic="general",
+            include_raw_content=False,  # Just summaries for speed
+            days=days,
+            config=config
+        )
+        for result_set in general_results:
+            if "results" in result_set:
+                all_results.extend(result_set["results"])
+    except Exception as e:
+        logging.warning(f"General search failed: {e}")
+    
+    # Optionally search news
+    if include_news:
+        try:
+            news_results = await tavily_search_async(
+                search_queries=queries[:2],  # Limit news queries
+                max_results=3,  # Fewer news results
+                topic="news",
+                include_raw_content=False,
+                days=min(days, 30),  # News should be more recent
+                config=config
+            )
+            for result_set in news_results:
+                if "results" in result_set:
+                    all_results.extend(result_set["results"])
+        except Exception as e:
+            logging.warning(f"News search failed: {e}")
+    
+    # Collect source URLs
+    sources_used = list(set(r.get("url", "") for r in all_results if r.get("url")))
+    
+    # Step 3: Extract structured context from results
+    if not all_results:
+        logging.warning("No search results for brief context, returning empty context")
+        return BriefContext()
+    
+    # Format results for extraction
+    formatted_results = "\n\n".join([
+        f"Title: {r.get('title', 'Unknown')}\nURL: {r.get('url', '')}\nContent: {r.get('content', '')[:500]}"
+        for r in all_results[:15]  # Limit to top 15 results
+    ])
+    
+    extract_model = init_chat_model(
+        model=configurable.summarization_model,
+        api_key=get_api_key_for_model(configurable.summarization_model, config),
+        tags=["langsmith:brief_context_extract"]
+    )
+    
+    extract_prompt = extract_brief_context_prompt.format(
+        days=days,
+        search_results=formatted_results,
+        user_query=user_messages
+    )
+    
+    try:
+        extract_response = await extract_model.ainvoke([HumanMessage(content=extract_prompt)])
+        import json
+        # Try to parse JSON from response
+        content = extract_response.content.strip()
+        # Handle markdown code blocks
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+        
+        extracted = json.loads(content)
+        
+        return BriefContext(
+            key_entities=extracted.get("key_entities", [])[:10],  # Limit entities
+            recent_events=extracted.get("recent_events", [])[:5],  # Limit events
+            key_metrics=extracted.get("key_metrics", [])[:8],  # Limit metrics
+            context_summary=extracted.get("context_summary", ""),
+            sources_used=sources_used[:10]  # Limit sources logged
+        )
+    except Exception as e:
+        logging.warning(f"Failed to extract brief context: {e}")
+        # Return partial context with just sources
+        return BriefContext(
+            context_summary="Context gathering completed but extraction failed.",
+            sources_used=sources_used[:10]
+        )
+
+
+def format_brief_context(context: BriefContext, days: int = 90) -> str:
+    """Format BriefContext into a string for injection into brief generation prompt."""
+    from open_deep_research.prompts import brief_context_injection_instructions
+    
+    return brief_context_injection_instructions.format(
+        days=days,
+        entities=", ".join(context.key_entities) if context.key_entities else "None discovered",
+        events="; ".join(context.recent_events) if context.recent_events else "None discovered",
+        metrics="; ".join(context.key_metrics) if context.key_metrics else "None discovered",
+        summary=context.context_summary or "No summary available",
+        sources=", ".join(context.sources_used[:5]) if context.sources_used else "None"
+    )
+
 
 async def summarize_webpage(model: BaseChatModel, webpage_content: str) -> str:
     """Summarize webpage content using AI model with timeout protection.
